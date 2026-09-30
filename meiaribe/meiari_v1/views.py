@@ -3,18 +3,42 @@ from django.shortcuts import render
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from .serializers import MeiAriUserSerializer, OTPVerifySerializer, ReportRecordSerializer, SubDeptDetailsDetailSerializer, SubDeptDetailsSerializer, SubDeptOfficeDetailsDetailSerializer, SubDeptOfficeDetailsSerializer, TNGovtDeptContactDetailSerializer, TNGovtDeptContactSerializer, TNGovtDeptDetailSerializer, TNGovtDeptSerializer, TNGovtSubDeptDetailSerializer, TNGovtSubDeptSerializer, WorkGroupDetailSerializer, WorkGroupDetailsDetailSerializer, WorkGroupDetailsSerializer, WorkGroupMemberDetailSerializer, WorkGroupMemberListSerializer, WorkGroupMemberSerializer, WorkGroupSerializer, WorkGroupTicketSerializer
+from .serializers import MeiAriUserListSerializer, MeiAriUserSerializer, OTPVerifySerializer, ReportRecordSerializer, SubDeptDetailsDetailSerializer, SubDeptDetailsSerializer, SubDeptOfficeDetailsDetailSerializer, SubDeptOfficeDetailsSerializer, TNGovtDeptContactDetailSerializer, TNGovtDeptContactSerializer, TNGovtDeptDetailSerializer, TNGovtDeptSerializer, TNGovtSubDeptDetailSerializer, TNGovtSubDeptSerializer, WorkGroupDetailSerializer, WorkGroupDetailsDetailSerializer, WorkGroupDetailsSerializer, WorkGroupMemberDetailSerializer, WorkGroupMemberListSerializer, WorkGroupMemberSerializer, WorkGroupSerializer, WorkGroupTicketSerializer
 from .models import MeiAriUser, MeiAriUserBioData, OTPTable, ReportRecord, SubDeptDetails, SubDeptOfficeDetails, TNGovtDept, TNGovtDeptContact, TNGovtSubDept, WorkGroup, WorkGroupDetails, WorkGroupMember, WorkGroupTicket
-from .methods import encrypt_password, EmailService, generate_filename, get_gemini_response, users_encode_token, decode_token
+from .methods import encrypt_password, EmailService, generate_filename, get_gemini_response, users_encode_token, ReportStorage
 from django.shortcuts import get_object_or_404
-from django.http import HttpResponse, JsonResponse
+from django.http import HttpResponse
+from django.db import transaction
+from django.utils import timezone
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.conf import settings
-from rest_framework.parsers import JSONParser, FormParser, MultiPartParser
-import requests
-import boto3
-from datetime import datetime
+from rest_framework.parsers import JSONParser
+from datetime import timedelta
 import traceback
+
+OTP_VALIDITY = timedelta(minutes=10)
+
+
+def send_otp_safely(user):
+    """Send an OTP email; report failure instead of raising so callers can respond cleanly."""
+    try:
+        EmailService().send_otp_email(user)
+        return True
+    except Exception:
+        traceback.print_exc()
+        return False
+
+
+def build_report_prompt(json_data):
+    return (
+        "You are writing an official inspection report for a Tamil Nadu government Inspection Cell. "
+        "Use only the facts in the data below; do not invent names, numbers or findings. "
+        "Write in clear, formal English using Markdown with these sections: "
+        "a one-line title (# heading), Summary, Details of inspection (office, location, date, inspector), "
+        "Observations, Issues found (with severity), Recommended actions (with who should act), and Conclusion. "
+        "If a section has no information, say so briefly.\n\n"
+        f"Inspection data (JSON):\n{json.dumps(json_data, indent=2)}"
+    )
 
 # Create your views here.
 class AppCheckAPIView(APIView):
@@ -33,16 +57,19 @@ class AppCheckAPIView(APIView):
     
 class MeiAriUserCreateAPIView(APIView):
     def post(self, request):
-        serializer = MeiAriUserSerializer(data=request.data)
-        raw_password = request.data.get('password')
-        encrypted_password = encrypt_password(raw_password)
-        request.data['password'] = encrypted_password
+        data = request.data.copy()
+        raw_password = data.get('password')
+        if not raw_password:
+            return Response({'error': {'password': ['This field is required.']}}, status=status.HTTP_400_BAD_REQUEST)
+        data['password'] = encrypt_password(raw_password)
+        serializer = MeiAriUserSerializer(data=data)
         if serializer.is_valid():
-            user = serializer.save()
-            # email_service = EmailService()
-            # email_service.send_otp_email(user)
-            return Response({'data': { 'user_id' : user.id }, 'message':""}, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            with transaction.atomic():
+                user = serializer.save()
+            otp_sent = send_otp_safely(user)
+            message = "User created. OTP sent to email." if otp_sent else "User created, but the OTP email could not be sent. Use resend-otp."
+            return Response({'data': { 'user_id' : user.id, 'otp_sent': otp_sent }, 'message': message}, status=status.HTTP_201_CREATED)
+        return Response({'error': serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
     
 class OTPVerifyAPIView(APIView):
     def post(self, request, *args, **kwargs):
@@ -53,7 +80,12 @@ class OTPVerifyAPIView(APIView):
             otp = serializer.validated_data['otp']
 
             # Get the OTP record for the user
-            otp_record = get_object_or_404(OTPTable, user_id=user_id, otp=otp)
+            otp_record = OTPTable.objects.filter(user_id=user_id, otp=otp).order_by('-created_at').first()
+            if not otp_record:
+                return Response({'error': "That code doesn't match. Check the email or send a new code."}, status=status.HTTP_400_BAD_REQUEST)
+            if timezone.now() - otp_record.created_at > OTP_VALIDITY:
+                otp_record.delete()
+                return Response({'error': "OTP has expired. Please request a new one."}, status=status.HTTP_400_BAD_REQUEST)
 
             # Get the user's bio data to retrieve the access_id
             user_bio_data = get_object_or_404(MeiAriUserBioData, user_id=user_id)
@@ -63,7 +95,24 @@ class OTPVerifyAPIView(APIView):
             
             return Response({'data': {'access_id': user_bio_data.access_id}, 'message': "OTP verified successfully"}, status=status.HTTP_200_OK)
         return Response({'error': serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
-    
+
+
+class ResendOTPAPIView(APIView):
+    def post(self, request):
+        email = request.data.get('email')
+        user_id = request.data.get('user_id')
+        if not email and not user_id:
+            return Response({'error': "email or user_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            user = MeiAriUser.objects.filter(**({'cug_email_address': email} if email else {'id': user_id})).first()
+        except Exception:
+            user = None
+        if not user:
+            return Response({'error': "User not found."}, status=status.HTTP_404_NOT_FOUND)
+        if not send_otp_safely(user):
+            return Response({'error': "Could not send OTP email."}, status=status.HTTP_502_BAD_GATEWAY)
+        return Response({'data': {'user_id': user.id}, 'message': "OTP sent to email."}, status=status.HTTP_200_OK)
+
 class SignInAPIView(APIView):
     def post(self, request):
         try:
@@ -71,23 +120,23 @@ class SignInAPIView(APIView):
             email = data.get("email")
             password = data.get("password")
 
-            # Check if the user exists
-            user = get_object_or_404(MeiAriUser, cug_email_address=email)
-            print("User found:", user)
-            # Verify password (assuming it's hashed)
-            if user.password != encrypt_password(password):
-                print(user.password, encrypt_password(password))
-                return Response({"message": "Invalid password"}, status=status.HTTP_401_UNAUTHORIZED)
-            print("User password verified successfully")
-            # Generate JWT token
-            token = users_encode_token(user.cug_phone_number, user.role)
-            refresh = RefreshToken.for_user(user)
-            print("Token:", token)
-            print("Refresh Token:", refresh.access_token)
+            if not email or not password:
+                return Response({"message": "email and password are required"}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Check if the user exists and verify password (stored hashed)
+            user = MeiAriUser.objects.filter(cug_email_address=email).first()
+            if not user or user.password != encrypt_password(password):
+                return Response({"message": "Invalid email or password"}, status=status.HTTP_401_UNAUTHORIZED)
+
             # Retrieve user bio data to get `access_id`
             user_bio = MeiAriUserBioData.objects.filter(user=user).first()
             access_id = user_bio.access_id if user_bio else None
-            print("Access ID:", access_id)
+            if user_bio and not user_bio.active:
+                return Response({"message": "User account is inactive"}, status=status.HTTP_403_FORBIDDEN)
+
+            # Generate JWT token
+            token = users_encode_token(str(user.id), user.role)
+            refresh = RefreshToken.for_user(user)
             
             dept_name = user.dept_id.department_name if user and user.dept_id else None
             sub_dept_name = user.sub_dept_id.sub_department_name if user and user.sub_dept_id else None
@@ -168,6 +217,8 @@ class TNGovtSubDeptAPIView(APIView):
     def get(self, request):
         try:
             tngovtdept = TNGovtSubDept.objects.all()
+            if request.query_params.get('department'):
+                tngovtdept = tngovtdept.filter(department_id=request.query_params['department'])
             serializer = TNGovtSubDeptDetailSerializer(tngovtdept, many=True)
             return Response({"data": serializer.data}, status=status.HTTP_200_OK)
         except Exception as e:
@@ -208,6 +259,8 @@ class SubDeptOfficeDetailsAPIView(APIView):
     def get(self, request):
         try:
             sub_dept_office_details = SubDeptOfficeDetails.objects.all()
+            if request.query_params.get('sub_dept'):
+                sub_dept_office_details = sub_dept_office_details.filter(sub_dept_id=request.query_params['sub_dept'])
             serializer = SubDeptOfficeDetailsDetailSerializer(sub_dept_office_details, many=True)
             return Response({"data": serializer.data}, status=status.HTTP_200_OK)
         except Exception as e:
@@ -296,16 +349,41 @@ class WorkGroupTicketAPIView(APIView):
         except Exception as e:
             return Response({"message": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)       
         
-    def get(self, request, ticket_id):
+    def get(self, request, ticket_id=None):
+        """
+        GET /workgroupticket/<ticket_id>/          -> that ticket
+        GET /workgroupticket/<work_group_id>/      -> list of the work group's tickets
+        GET /workgroupticket/?work_group=<id>      -> list of the work group's tickets
+        """
         try:
-            workgroup_ticket = WorkGroupTicket.objects.get(work_group=ticket_id)
-            print("Ticket found:", workgroup_ticket)
-            serializer = WorkGroupTicketSerializer(workgroup_ticket)
+            if ticket_id is not None:
+                workgroup_ticket = WorkGroupTicket.objects.filter(id=ticket_id).first()
+                if workgroup_ticket:
+                    serializer = WorkGroupTicketSerializer(workgroup_ticket)
+                    return Response({"data": serializer.data}, status=status.HTTP_200_OK)
+                work_group_id = ticket_id
+            else:
+                work_group_id = request.query_params.get("work_group")
+
+            tickets = WorkGroupTicket.objects.all()
+            if work_group_id:
+                if not WorkGroup.objects.filter(id=work_group_id).exists():
+                    return Response({"error": "WorkGroupTicket not found"}, status=status.HTTP_404_NOT_FOUND)
+                tickets = tickets.filter(work_group_id=work_group_id)
+            serializer = WorkGroupTicketSerializer(tickets.order_by('-created_at'), many=True)
             return Response({"data": serializer.data}, status=status.HTTP_200_OK)
-        except WorkGroupTicket.DoesNotExist:
-            return Response({"error": "WorkGroupTicket not found"}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
             return Response({"message": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def patch(self, request, ticket_id=None):
+        ticket = WorkGroupTicket.objects.filter(id=ticket_id).first() if ticket_id else None
+        if not ticket:
+            return Response({"error": "WorkGroupTicket not found"}, status=status.HTTP_404_NOT_FOUND)
+        serializer = WorkGroupTicketSerializer(ticket, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            return Response({"data": serializer.data, "message": "Ticket updated"}, status=status.HTTP_200_OK)
+        return Response({"error": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
         
 class WorkGroupTicketStatusCountAPIView(APIView):
     def get(self, request, work_group_id):
@@ -322,11 +400,9 @@ class WorkGroupTicketStatusCountAPIView(APIView):
 
         # Get queryset for the given work group
         queryset = WorkGroupTicket.objects.filter(work_group=work_group)
-        print("Queryset:", queryset)
 
         for status_type in status_types:
             ticket_counts[status_type] = queryset.filter(ticket_status=status_type).count()
-        print("Ticket counts:", ticket_counts)
         return Response({"data": ticket_counts}, status=status.HTTP_200_OK)
     
 class CreateWorkGroupWithDetailsAPIView(APIView):
@@ -337,15 +413,12 @@ class CreateWorkGroupWithDetailsAPIView(APIView):
             "group_name": request.data.get("group_name"),
             "is_active": request.data.get("is_active", True)
         })
-        print("WorkGroup data:", work_group_serializer.initial_data)
         if work_group_serializer.is_valid():
             work_group = work_group_serializer.save()
-            print("WorkGroup created:", work_group)
             # Serialize WorkGroupDetails
             work_group_details_serializer = WorkGroupDetailsSerializer(data={
                 "work_group": work_group.id,
                 "group_description": request.data.get("group_description"),
-                # "group_photo": request.FILES.get("group_photo")
             })
 
             if work_group_details_serializer.is_valid():
@@ -375,6 +448,7 @@ class WorkGroupListBySubDeptAPIView(APIView):
             try:
                 details = WorkGroupDetails.objects.get(work_group=group)
                 response_data.append({
+                    "id": group.id,
                     "group_name": group.group_name,
                     "group_description": details.group_description
                 })
@@ -386,60 +460,41 @@ class WorkGroupListBySubDeptAPIView(APIView):
 
 class GenerateAndUploadReport(APIView):
     parser_classes = [JSONParser]
+    required_fields = ["location", "departmentName", "subDepartmentName", "accessId", "subDeptOfficeName"]
 
     def post(self, request):
-        print("Request Data:", request.data)
         try:
-            # Step 1: Call GeminiReportResponse API
-            gemini_url = "http://192.168.107.231:8000/api/v1/gemini-report-response/"
             gemini_payload = request.data
+            missing = [field for field in self.required_fields if field not in gemini_payload]
+            location = gemini_payload.get("location")
+            if not isinstance(location, dict) or not all(k in location for k in ("city", "latitude", "longitude")):
+                missing.append("location.city/latitude/longitude")
+            if missing:
+                return Response({"error": f"Missing fields: {', '.join(missing)}"}, status=status.HTTP_400_BAD_REQUEST)
 
-            gemini_response = requests.post(gemini_url, json=gemini_payload)
+            department_name = gemini_payload["departmentName"]
+            sub_department_name = gemini_payload["subDepartmentName"]
+            access_id = gemini_payload["accessId"]
+            
+            sub_dept_office_id = gemini_payload["subDeptOfficeName"]
+            sub_dept_office_instance = SubDeptOfficeDetails.objects.filter(id=sub_dept_office_id).first()
+            if not sub_dept_office_instance:
+                return Response({"error": "SubDeptOfficeDetails not found."}, status=status.HTTP_404_NOT_FOUND)
 
-            if gemini_response.status_code != 200:
-                return Response(
-                    {"error": "Failed to generate report", "details": gemini_response.json()},
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
-                )
-
-            summary_report_text = gemini_response.json().get("data", {}).get("summary_report", "")
+            # Step 1: Generate the report with Gemini
+            summary_report_text = get_gemini_response(build_report_prompt(gemini_payload))
             if not summary_report_text:
                 return Response(
                     {"error": "Generated report is empty."},
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR
                 )
 
-            location = gemini_payload["location"]
-            department_name = gemini_payload["departmentName"]
-            sub_department_name = gemini_payload["subDepartmentName"]
-            access_id = gemini_payload["accessId"]
-            
-            sub_dept_office_id = gemini_payload["subDeptOfficeName"]
-            try:
-                sub_dept_office_instance = SubDeptOfficeDetails.objects.get(id=sub_dept_office_id)
-            except SubDeptOfficeDetails.DoesNotExist:
-                return Response({"error": "SubDeptOfficeDetails not found."}, status=404)
-
-            # Step 2: Upload report to S3
-            folder_name = "samplefolder"
+            # Step 2: Upload report to S3 (or local storage when S3 is not configured)
             file_name = generate_filename("generated_report")
-            file_path = f"{folder_name}/{department_name}/{sub_department_name}/{sub_dept_office_id}/{file_name}.txt"
+            file_path = f"{settings.REPORTS_FOLDER}/{department_name}/{sub_department_name}/{sub_dept_office_id}/{file_name}.txt"
+            ReportStorage().save(file_path, summary_report_text)
 
-            s3_client = boto3.client(
-                "s3",
-                aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-                aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-                region_name=settings.AWS_S3_REGION_NAME
-            )
-
-            s3_client.put_object(
-                Bucket=settings.AWS_STORAGE_BUCKET_NAME,
-                Key=file_path,
-                Body=summary_report_text,
-                ContentType="text/plain"
-            )
-
-            # ✅ Step 3: Save to DB
+            # Step 3: Save to DB
             report = ReportRecord.objects.create(
                 city=location["city"],
                 latitude=location["latitude"],
@@ -453,7 +508,8 @@ class GenerateAndUploadReport(APIView):
             )
 
             return Response(
-                {"message": f"Report successfully generated, uploaded, and saved to DB.", "report_id": report.id},
+                {"message": f"Report successfully generated, uploaded, and saved to DB.", "report_id": report.id,
+                 "data": {"report_id": report.id, "summary_report": summary_report_text}},
                 status=status.HTTP_201_CREATED
             )
 
@@ -470,14 +526,10 @@ class GeminiReportResponse(APIView):
         try:
             json_data = request.data
             
-            # Debug: Log incoming request
-            print("Received JSON:", json.dumps(json_data, indent=2))
-
             if not json_data:
                 return Response({"error": "Empty JSON payload"}, status=status.HTTP_400_BAD_REQUEST)
 
-            prompt = f"Create a Detailed report using the content: {json.dumps(json_data)}"
-            summary_report = get_gemini_response(prompt)
+            summary_report = get_gemini_response(build_report_prompt(json_data))
 
             return Response({"data":{"summary_report": summary_report}}, status=status.HTTP_200_OK)
         except Exception as e:
@@ -528,15 +580,7 @@ class DownloadReportAPIView(APIView):
         file_path = report.file_path  # Example: "samplefolder/xyz.txt"
 
         try:
-            s3_client = boto3.client(
-                's3',
-                aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-                aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-                region_name=settings.AWS_S3_REGION_NAME,
-            )
-
-            s3_object = s3_client.get_object(Bucket=settings.AWS_STORAGE_BUCKET_NAME, Key=file_path)
-            file_content = s3_object['Body'].read().decode('utf-8')
+            file_content = ReportStorage().read(file_path)
 
             response = HttpResponse(file_content, content_type='text/plain')
             response['Content-Disposition'] = f'attachment; filename="{file_path.split("/")[-1]}"'
@@ -544,3 +588,11 @@ class DownloadReportAPIView(APIView):
 
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class MeiAriUserListAPIView(APIView):
+    def get(self, request):
+        users = MeiAriUser.objects.prefetch_related('meiariuserbiodata_set').order_by('created_at')
+        if request.query_params.get('sub_dept_office'):
+            users = users.filter(sub_dept_office_id=request.query_params['sub_dept_office'])
+        return Response({"data": MeiAriUserListSerializer(users, many=True).data}, status=status.HTTP_200_OK)

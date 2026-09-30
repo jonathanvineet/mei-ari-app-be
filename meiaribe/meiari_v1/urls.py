@@ -1,5 +1,5 @@
 from django.urls import path
-from .views import ( AppCheckAPIView, DownloadReportAPIView, GeminiReportResponse, MeiAriUserCreateAPIView, ReportBySubDeptOfficeAPIView, SignInAPIView, OTPVerifyAPIView, TNGovtDeptAPIView, TNGovtDeptContactAPIView,
+from .views import ( AppCheckAPIView, DownloadReportAPIView, GeminiReportResponse, MeiAriUserCreateAPIView, MeiAriUserListAPIView, ReportBySubDeptOfficeAPIView, ResendOTPAPIView, SignInAPIView, OTPVerifyAPIView, TNGovtDeptAPIView, TNGovtDeptContactAPIView,
                     TNGovtSubDeptAPIView, SubDeptDetailsAPIView, SubDeptOfficeDetailsAPIView, UpdateTicketStatusAPIView, WorkGroupAPIView, WorkGroupDetailAPIView, WorkGroupListBySubDeptAPIView,
                     WorkGroupMembersAPIView, WorkGroupMembersListAPIView, WorkGroupTicketAPIView, WorkGroupTicketStatusCountAPIView, CreateWorkGroupWithDetailsAPIView,
                     GenerateAndUploadReport) 
@@ -8,6 +8,8 @@ urlpatterns = [
     path('check/', AppCheckAPIView.as_view(), name = 'geminiapp-check'),
     path('create-meiari-user/', MeiAriUserCreateAPIView.as_view(), name='create-meiari-user'),
     path("verify-otp/", OTPVerifyAPIView.as_view(), name="verify-otp"),
+    path("resend-otp/", ResendOTPAPIView.as_view(), name="resend-otp"),
+    path("users/", MeiAriUserListAPIView.as_view(), name="users"),
     path("signin/", SignInAPIView.as_view(), name="signin"),
     path("tngovtdept/", TNGovtDeptAPIView.as_view(), name="tngovtdept"),
     path("tngovtdept-contact/", TNGovtDeptContactAPIView.as_view(), name="tngovtdept-contact"),

@@ -10,7 +10,7 @@ class MeiAriUserBioDataSerializer(serializers.ModelSerializer):
         ]
 
 class MeiAriUserSerializer(serializers.ModelSerializer):
-    bio_data = MeiAriUserBioDataSerializer(source='meiariuserbiodata', read_only=False)
+    bio_data = MeiAriUserBioDataSerializer(source='meiariuserbiodata', write_only=True)
 
     class Meta:
         model = MeiAriUser
@@ -18,6 +18,17 @@ class MeiAriUserSerializer(serializers.ModelSerializer):
             'cug_phone_number', 'cug_email_address', 'password',
             'role', 'bio_data', 'dept_id', 'sub_dept_id', 'sub_dept_office_id',
         ]
+        extra_kwargs = {'password': {'write_only': True}}
+
+    def validate(self, attrs):
+        dept = attrs.get('dept_id')
+        sub_dept = attrs.get('sub_dept_id')
+        if dept and sub_dept and sub_dept.department_id != dept.id:
+            raise serializers.ValidationError({'sub_dept_id': 'Sub department does not belong to the selected department.'})
+        office = attrs.get('sub_dept_office_id')
+        if office and sub_dept and office.sub_dept_id != sub_dept.id:
+            raise serializers.ValidationError({'sub_dept_office_id': 'Office does not belong to the selected sub department.'})
+        return attrs
 
     def create(self, validated_data):
         bio_data = validated_data.pop('meiariuserbiodata')
@@ -75,7 +86,7 @@ class TNGovtSubDeptSerializer(serializers.ModelSerializer):
 class TNGovtSubDeptDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = TNGovtSubDept
-        fields = ['id', 'sub_department_name']
+        fields = ['id', 'department', 'sub_department_name']
         
 class SubDeptDetailsSerializer(serializers.ModelSerializer):
     class Meta:
@@ -130,12 +141,37 @@ class WorkGroupMemberDetailSerializer(serializers.ModelSerializer):
 class WorkGroupMemberListSerializer(serializers.ModelSerializer):
     class Meta:
         model = WorkGroupMember
-        fields = ['user_id', 'role_name', 'joined_at']
+        fields = ['id', 'user_id', 'role_name', 'joined_at', 'name', 'email', 'role']
+
+    def _user(self, obj):
+        cache = self.context.setdefault('users', {})
+        if obj.user_id not in cache:
+            cache[obj.user_id] = MeiAriUser.objects.filter(id=obj.user_id).prefetch_related('meiariuserbiodata_set').first()
+        return cache[obj.user_id]
+
+    def get_name(self, obj):
+        user = self._user(obj)
+        bio = user.meiariuserbiodata_set.first() if user else None
+        return f"{bio.first_name} {bio.last_name}".strip() if bio else None
+
+    def get_email(self, obj):
+        user = self._user(obj)
+        return user.cug_email_address if user else None
+
+    def get_role(self, obj):
+        user = self._user(obj)
+        return user.role if user else None
+
+    name = serializers.SerializerMethodField()
+    email = serializers.SerializerMethodField()
+    role = serializers.SerializerMethodField()
         
 class WorkGroupTicketSerializer(serializers.ModelSerializer):
     class Meta:
         model = WorkGroupTicket
-        fields = ['work_group', 'ticket_title', 'ticket_description', 'ticket_status', 'ticket_priority', 'ticket_type', 'ticket_owner_id']
+        fields = ['id', 'ticket_code', 'work_group', 'ticket_title', 'ticket_description', 'ticket_status', 'ticket_priority', 'ticket_type', 'ticket_owner_id', 'created_at']
+        read_only_fields = ['id', 'ticket_code', 'created_at']
+        extra_kwargs = {'ticket_status': {'default': 'Created'}}
         
 class WorkGroupTicketDetailSerializer(serializers.ModelSerializer):
     class Meta:
@@ -145,9 +181,23 @@ class WorkGroupTicketDetailSerializer(serializers.ModelSerializer):
 class ReportRecordSerializer(serializers.ModelSerializer):
     class Meta:
         model = ReportRecord
-        fields = ['city', 'latitude', 'longitude', 'department_name', 'sub_department_name', 'sub_dept_office_name', 'access_id', 'file_path', 'ticket_status_type']
-        
-class ReportRecordSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = ReportRecord
         fields = '__all__'
+
+class MeiAriUserListSerializer(serializers.ModelSerializer):
+    name = serializers.SerializerMethodField()
+    access_id = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MeiAriUser
+        fields = ['id', 'name', 'cug_email_address', 'cug_phone_number', 'role', 'access_id', 'sub_dept_office_id']
+
+    def _bio(self, obj):
+        return obj.meiariuserbiodata_set.first()
+
+    def get_name(self, obj):
+        bio = self._bio(obj)
+        return f"{bio.first_name} {bio.last_name}".strip() if bio else None
+
+    def get_access_id(self, obj):
+        bio = self._bio(obj)
+        return bio.access_id if bio else None

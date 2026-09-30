@@ -40,7 +40,13 @@ class MeiAriUserBioData(models.Model):
     def save(self, *args, **kwargs):
         """Automatically set access_id before saving the instance."""
         if not self.access_id:  # Generate only if not already set
-            self.access_id = self.generate_access_id()
+            base = self.generate_access_id()
+            access_id, suffix = base, 1
+            # Two users can share a name prefix and birthday; keep access_id unique
+            while MeiAriUserBioData.objects.filter(access_id=access_id).exclude(pk=self.pk).exists():
+                suffix += 1
+                access_id = f"{base}{suffix}"
+            self.access_id = access_id
         super().save(*args, **kwargs)
 
     def __str__(self):
@@ -54,7 +60,7 @@ class OTPTable(models.Model):
     modified_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
-        return f"OTP {self.otp} for {self.user.email}"
+        return f"OTP {self.otp} for {self.user.cug_email_address}"
     
     
 class TNGovtDept(models.Model):
@@ -145,6 +151,11 @@ class WorkGroupTicket(models.Model):
     ticket_owner_id = models.ForeignKey(MeiAriUser, on_delete=models.CASCADE, null=True, blank=True)
     user_id = models.ManyToManyField(MeiAriUser, blank=True, related_name='tickets')
     created_at = models.DateTimeField(auto_now_add=True)
+
+    def save(self, *args, **kwargs):
+        if not self.ticket_code:
+            self.ticket_code = f"TKT-{uuid.uuid4().hex[:10].upper()}"
+        super().save(*args, **kwargs)
     
     
 TICKET_STATUS_CHOICES = [
