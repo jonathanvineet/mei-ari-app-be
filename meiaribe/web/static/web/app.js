@@ -150,11 +150,11 @@
 
   /* ---------- routing ---------- */
   const routes = [
-    [/^\/home$/, viewHome, { public: true }],
+    [/^\/(?:home)?$/, viewHome, { public: true }],
     [/^\/login$/, viewLogin, { public: true }],
     [/^\/signup$/, viewSignup, { public: true }],
     [/^\/verify\/([\w-]+)$/, viewVerify, { public: true }],
-    [/^\/$/, viewDashboard],
+    [/^\/overview$/, viewDashboard],
     [/^\/inspect$/, viewInspect],
     [/^\/reports$/, viewReports],
     [/^\/reports\/([\w-]+)$/, viewReport],
@@ -172,10 +172,10 @@
   async function router() {
     const { path, query } = parseHash();
     const match = routes.find(([re]) => re.test(path));
-    if (!match) { location.hash = '#/'; return; }
+    if (!match) { location.hash = session?.token ? '#/overview' : '#/'; return; }
     const [re, view, opts = {}] = match;
-    if (!opts.public && !session?.token) { location.hash = path === '/' ? '#/home' : '#/login'; return; }
-    if (opts.public && session?.token && path === '/login') { location.hash = '#/'; return; }
+    if (!opts.public && !session?.token) { location.hash = '#/login'; return; }
+    if (opts.public && session?.token && path === '/login') { location.hash = '#/overview'; return; }
     const params = path.match(re).slice(1);
     try {
       if (opts.public) await view(...params, query);
@@ -190,7 +190,7 @@
 
   /* ---------- shell ---------- */
   const NAV = [
-    ['#/', 'Overview', /^\/$/],
+    ['#/overview', 'Overview', /^\/overview$/],
     ['#/inspect', 'New inspection', /^\/inspect/],
     ['#/reports', 'Reports', /^\/reports/],
     ['#/groups', 'Work groups', /^\/groups/],
@@ -205,7 +205,7 @@
     app.innerHTML = `
       <div class="shell">
         <aside class="rail">
-          <a class="wordmark" href="#/"><span class="seal" aria-hidden="true">MA</span><strong>Mei Ari</strong></a>
+          <a class="wordmark" href="#/overview"><span class="seal" aria-hidden="true">MA</span><strong>Mei Ari</strong></a>
           <div class="office-card">
             <div class="name">${esc(office?.sub_dept_office_location || 'Your office')}</div>
             <div class="small muted">${esc(u.sub_department_name || '')}</div>
@@ -214,12 +214,12 @@
           <nav class="nav" aria-label="Main">${nav.map(link).join('')}</nav>
           <div class="rail-foot">
             <div class="me"><div>${esc(u.email || '')}</div><div class="role">${esc(ROLE_LABEL[u.role] || u.role || '')}</div><div class="role">Access ID ${esc(u.access_id || '—')}</div></div>
-            <a class="small" href="#/home">How Mei Ari works</a>
+            <a class="small" href="#/">How Mei Ari works</a>
             <button class="btn quiet small" data-action="signout">Sign out</button>
           </div>
         </aside>
         <header class="mobile-bar">
-          <a class="wordmark" href="#/"><span class="seal" aria-hidden="true">MA</span><strong>Mei Ari</strong></a>
+          <a class="wordmark" href="#/overview"><span class="seal" aria-hidden="true">MA</span><strong>Mei Ari</strong></a>
           <div class="office">${esc(office?.sub_dept_office_location || '')}<br><button class="linkish small" data-action="signout">Sign out</button></div>
         </header>
         <main class="main" id="main">${content}</main>
@@ -248,14 +248,14 @@
   async function viewHome() {
     const signedIn = !!session?.token;
     const cta = signedIn
-      ? `<a class="btn" href="#/">Go to your office</a>`
+      ? `<a class="btn" href="#/overview">Go to your office</a>`
       : `<a class="btn" href="#/login">Sign in</a><a class="btn secondary on-band" href="#/signup">Create an account</a>`;
     app.innerHTML = `
       <div class="home">
         <header class="home-band">
           <nav class="home-nav" aria-label="Site">
-            <a class="wordmark" href="#/home" style="color:inherit"><span class="seal" aria-hidden="true" style="--sheet:var(--band)">MA</span><strong>Mei Ari</strong></a>
-            <div class="home-nav-links">${signedIn ? '<a href="#/">Your office</a>' : '<a href="#/login">Sign in</a>'}</div>
+            <a class="wordmark" href="#/" style="color:inherit"><span class="seal" aria-hidden="true" style="--sheet:var(--band)">MA</span><strong>Mei Ari</strong></a>
+            <div class="home-nav-links">${signedIn ? '<a href="#/overview">Your office</a>' : '<a href="#/login">Sign in</a>'}</div>
           </nav>
           <div class="home-hero">
             <div class="home-hero-copy">
@@ -326,7 +326,7 @@
 
           <section class="home-close">
             <h2>${signedIn ? 'Pick up where you left off.' : 'Ready to file your first inspection?'}</h2>
-            <div class="home-cta">${signedIn ? '<a class="btn" href="#/inspect">Start an inspection</a><a class="btn quiet" href="#/">Go to your office</a>' : '<a class="btn" href="#/signup">Create an account</a><a class="btn quiet" href="#/login">Sign in</a>'}</div>
+            <div class="home-cta">${signedIn ? '<a class="btn" href="#/inspect">Start an inspection</a><a class="btn quiet" href="#/overview">Go to your office</a>' : '<a class="btn" href="#/signup">Create an account</a><a class="btn quiet" href="#/login">Sign in</a>'}</div>
           </section>
         </main>
       </div>`;
@@ -337,7 +337,7 @@
     app.innerHTML = `
       <div class="auth">
         <section class="auth-side">
-          <a class="wordmark" href="#/home" style="color:inherit"><span class="seal" aria-hidden="true" style="--sheet:var(--band)">MA</span><strong>Mei Ari</strong></a>
+          <a class="wordmark" href="#/" style="color:inherit"><span class="seal" aria-hidden="true" style="--sheet:var(--band)">MA</span><strong>Mei Ari</strong></a>
           <div>
             <h1>Inspect, report, and get it signed.</h1>
             <p>Record what you find on an inspection, get a formal report drafted for you, and track it through review, verification and sign-off.</p>
@@ -372,7 +372,7 @@
         try {
           const res = await api('signin/', { method: 'POST', body });
           saveSession({ token: res.token, user: res.data });
-          location.hash = '#/';
+          location.hash = '#/overview';
         } catch (err) { showError(form, err.message); }
       });
     });
